@@ -16,10 +16,9 @@ pool.on('error', (err) => {
   process.exit(-1);
 });
 
-// Use a map to store active connections.
-// Key: userId
-// Value: Array of objects { res, channels: [] }
-const clients = new Map();
+// Array to store active connected SSE clients
+// Format: { userId, channels: [], res }
+let clients = [];
 
 // Endpoint: GET /health
 app.get('/health', (req, res) => {
@@ -28,10 +27,8 @@ app.get('/health', (req, res) => {
 
 // Periodic Heartbeat every 30 seconds
 setInterval(() => {
-  for (const [userId, userClients] of clients.entries()) {
-    for (const client of userClients) {
-      client.res.write(': heartbeat\n\n');
-    }
+  for (const client of clients) {
+    client.res.write(': heartbeat\n\n');
   }
 }, 30000);
 
@@ -50,19 +47,18 @@ app.post('/api/events/publish', async (req, res) => {
 
     const event = result.rows[0];
 
+    console.log(`Event published: ${eventType} to channel ${channel}`);
+
     // Push to active subscribers
-    for (const [userId, userClients] of clients.entries()) {
-      for (const client of userClients) {
-        if (client.channels.includes(channel)) {
-          const data = JSON.stringify(event.payload);
-          client.res.write(`id: ${event.id}\n`);
-          client.res.write(`event: ${event.event_type}\n`);
-          client.res.write(`data: ${data}\n\n`);
-        }
+    for (const client of clients) {
+      if (client.channels.includes(channel)) {
+        client.res.write(`event: ${eventType}\n`);
+        client.res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        console.log(`Event sent to client: ${client.userId}`);
       }
     }
 
-    res.status(202).send();
+    res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -128,24 +124,26 @@ app.post('/api/events/channels/unsubscribe', async (req, res) => {
 // Endpoint: GET /api/events/stream
 app.get('/api/events/stream', async (req, res) => {
   const userId = parseInt(req.query.userId, 10);
-  const channelsQuery = req.query.channels;
+  const rawChannels = req.query.channels;
 
-  if (isNaN(userId) || !channelsQuery) {
+  if (isNaN(userId) || !rawChannels) {
     return res.status(400).json({ error: 'valid userId and channels query parameters are required' });
   }
 
-  const requestedChannels = channelsQuery.split(',');
+  const channelsArray = rawChannels
+    ? String(rawChannels).split(',').map(c => c.trim()).filter(Boolean)
+    : [];
 
   try {
     // Verify user is subscribed to these channels
     const result = await pool.query(
         'SELECT channel FROM user_subscriptions WHERE user_id = $1 AND channel = ANY($2)',
-        [userId, requestedChannels]
+        [userId, channelsArray]
     );
     const subscribedChannels = result.rows.map(row => row.channel);
 
     // Only allow streaming for channels they are actually subscribed to
-    const validChannels = requestedChannels.filter(c => subscribedChannels.includes(c));
+    const validChannels = channelsArray.filter(c => subscribedChannels.includes(c));
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -174,24 +172,21 @@ app.get('/api/events/stream', async (req, res) => {
         }
     }
 
-    const clientObj = { res, channels: validChannels };
+    const clientObj = {
+      userId,
+      channels: channelsArray,
+      res
+    };
 
-    if (!clients.has(userId)) {
-        clients.set(userId, []);
-    }
-    clients.get(userId).push(clientObj);
+    clients.push(clientObj);
+    console.log("Client connected:", userId, channelsArray);
 
     // Clean up on disconnect
     req.on('close', () => {
-        const userClients = clients.get(userId);
-        if (userClients) {
-            const index = userClients.indexOf(clientObj);
-            if (index !== -1) {
-                userClients.splice(index, 1);
-            }
-            if (userClients.length === 0) {
-                clients.delete(userId);
-            }
+        console.log(`Client disconnected: userId=${userId}`);
+        const index = clients.indexOf(clientObj);
+        if (index !== -1) {
+            clients.splice(index, 1);
         }
     });
 
